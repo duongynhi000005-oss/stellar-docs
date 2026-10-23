@@ -499,6 +499,7 @@
                 "group": "Migrate from Another Chain",
                 "root": "docs/learn/migrate/index",
                 "pages": [
+                  "docs/learn/migrate/solana",
                   {
                     "group": "EVM Networks",
                     "root": "docs/learn/migrate/evm/index",

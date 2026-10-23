@@ -1,7 +1,377 @@
 ---
-title: Solana
-description: Migrate your smart contract code from Solana to Soroban
-draft: true
+title: Solana to Stellar (Soroban) Migration Guide
+sidebarTitle: "Solana Developers"
+"og:title": "Migrating from Solana to Stellar Soroban"
+description: "A comprehensive developer guide for Solana Rust engineers transitioning to smart contract development on Stellar Soroban."
 ---
 
-I dunno, like copy/paste it?
+If you are a Solana developer looking to build on Stellar, you will find yourself in familiar territory: both ecosystems leverage **Rust** as their primary smart contract language and prioritize high-throughput, low-latency execution.
+
+However, the underlying execution models, storage philosophies, and authorization frameworks diverge in meaningful ways. Soroban (Stellar's smart contract platform) executes WebAssembly (Wasm) contracts with a unified state model, built-in multi-tier state archival, and an expressive, integrated cryptographic authorization framework.
+
+This guide provides an architectural mapping, side-by-side code comparisons, and developer tooling transitions to help you migrate your mental model from Solana (and Anchor) to Stellar Soroban.
+
+---
+
+## Architecture & Mental Model Comparison
+
+| Concept | Solana | Stellar (Soroban) |
+| :-- | :-- | :-- |
+| **Execution VM** | Solana BPF (sBFV / Sealevel runtime) | WebAssembly (Wasm runtime via Wasmi/Wasmtime) |
+| **Language & Framework** | Rust (commonly with Anchor framework) | Rust with official `soroban-sdk` |
+| **Account / Identity Model** | Distinct Executable Program Accounts + Data Accounts (PDAs) | Unified Contract Address (`Address`) holding both logic and state |
+| **Data Storage** | Accounts with explicit serialized byte buffers (Borsh) | Key-value store under contract identity (`Instance`, `Persistent`, `Temporary`) |
+| **State Expiration** | Rent exemption (holding minimum SOL balance) | State Archival TTL (Time-To-Live) with explicit `extend_ttl` bumping |
+| **Authorization** | Transaction signature bitflags (`Signer<'info>` / `is_signer`) | Native auth framework (`Address::require_auth()`) with scoped invocation trees |
+| **Cross-Contract Calls** | Cross-Program Invocations (CPI) via `invoke` / `invoke_signed` | Typed client invocations (`ContractClient`) generated from contract specs |
+| **Standard Tokens** | SPL-Token Program (Mint + Associated Token Accounts) | Stellar Asset Contract (SAC) & SEP-41 standard token interface |
+| **Resource Metering** | Compute Units (CU) + Priority fees | Resource limits (CPU instructions, memory, read/write bytes, storage footprint) |
+| **Local Testing** | `solana-test-validator` + TypeScript tests or Anchor bankrun | In-memory Rust tests (`soroban-sdk::Env::default()`) via standard `cargo test` |
+
+---
+
+## 1. Storage & State Management
+
+### From Solana PDAs to Soroban Storage Tiers
+
+On Solana, programs are strictly stateless. To persist data, programs write to separate accounts derived via Program Derived Addresses (PDAs) using deterministic seeds and a bump seed.
+
+On Soroban, contracts have direct access to their own isolated key-value storage via `env.storage()`. Instead of managing accounts and seed derivation manually, you define Rust types (such as enums or structs with `#[contracttype]`) as storage keys.
+
+Soroban offers three distinct storage tiers to balance cost and persistence:
+
+1. **Instance Storage (`env.storage().instance()`)**:
+   - Shared across the entire contract instance.
+   - Ideal for global protocol configuration, admin addresses, and global counters.
+   - Automatically loaded into memory whenever any contract function is invoked.
+   - Bound to the lifetime of the contract instance.
+
+2. **Persistent Storage (`env.storage().persistent()`)**:
+   - Used for user-specific data that must survive indefinitely, such as token balances, user profiles, or vault stakes.
+   - Each entry has an independent Time-To-Live (TTL).
+   - If a persistent entry's TTL lapses without being bumped, the data moves to the **Archived** state (it is not permanently lost, but must be restored before access).
+
+3. **Temporary Storage (`env.storage().temporary()`)**:
+   - Ideal for transient data such as price oracle signatures, claim nonces, or governance vote tallies.
+   - Once its TTL expires, the entry is permanently deleted without archival overhead, saving storage fees.
+
+### Rent vs. TTL & State Archival
+
+- **Solana**: You pay a one-time rent-exemption fee in SOL per byte. As long as the account holds the minimum balance, it remains on-chain forever.
+- **Soroban**: State uses a Time-To-Live (TTL) counter measured in ledgers. Contracts actively manage rent by bumping their TTL when accessed:
+
+```rust
+// Bump persistent storage key TTL if it has fewer than 10,000 ledgers remaining,
+// extending it up to 100,000 ledgers (~5 days on Stellar).
+env.storage().persistent().extend_ttl(&user_key, 10_000, 100_000);
+```
+
+---
+
+## 2. Authorization & Security
+
+In Solana, authorization is account-based: the runtime inspects signatures prior to program execution and flags accounts as `is_signer = true`. Anchor abstracts this with the `Signer<'info>` account constraint.
+
+In Soroban, authorization is **dynamic, cryptographic, and programmatic**:
+
+- A contract receives an `Address` parameter representing the caller or account owner.
+- The contract invokes `address.require_auth()` at the exact point authorization is needed.
+- Soroban's runtime verifies that the transaction was signed by that address (or that a valid signature/contract invocation authorization was provided).
+
+```rust
+// Ensures that 'caller' authorized this contract invocation
+caller.require_auth();
+
+// Can also authorize specific function parameters:
+caller.require_auth_for_args((amount, recipient).into_val(&env));
+```
+
+<Note>
+
+Unlike Solana where signers must be passed in the instruction's account array, Soroban allows smart accounts, multi-sig contracts, and external accounts to authorize calls uniformly through `Address`.
+
+</Note>
+
+---
+
+## 3. Side-by-Side Implementation: Stateful Counter
+
+To illustrate how concepts translate directly, here is an identical stateful counter with an admin and authorized increments written in both Anchor (Solana) and Soroban (Stellar).
+
+<CodeGroup>
+
+```rust Solana (Anchor)
+use anchor_lang::prelude::*;
+
+declare_id!("Coun7er1111111111111111111111111111111111111");
+
+#[program]
+pub mod solana_counter {
+    use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        let counter = &mut ctx.accounts.counter;
+        counter.admin = ctx.accounts.admin.key();
+        counter.count = 0;
+        Ok(())
+    }
+
+    pub fn increment(ctx: Context<Increment>) -> Result<u64> {
+        let counter = &mut ctx.accounts.counter;
+        // Verify caller is the authorized user
+        counter.count = counter.count.checked_add(1).unwrap();
+        emit!(CounterIncremented {
+            user: ctx.accounts.user.key(),
+            new_count: counter.count,
+        });
+        Ok(counter.count)
+    }
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + 32 + 8,
+        seeds = [b"counter"],
+        bump
+    )]
+    pub counter: Account<'info, CounterState>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Increment<'info> {
+    #[account(mut, seeds = [b"counter"], bump)]
+    pub counter: Account<'info, CounterState>,
+    pub user: Signer<'info>,
+}
+
+#[account]
+pub struct CounterState {
+    pub admin: Pubkey,
+    pub count: u64,
+}
+
+#[event]
+pub struct CounterIncremented {
+    pub user: Pubkey,
+    pub new_count: u64,
+}
+```
+
+```rust Stellar (Soroban)
+#![no_std]
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol
+};
+
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey {
+    Admin,
+    Count,
+}
+
+#[contract]
+pub struct CounterContract;
+
+#[contractimpl]
+impl CounterContract {
+    /// Initialize the contract with an admin address
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Count, &0u64);
+    }
+
+    /// Increment counter; requires authorization from the calling user
+    pub fn increment(env: Env, user: Address) -> u64 {
+        // Enforce user authorization (equivalent to Signer<'info>)
+        user.require_auth();
+
+        let mut count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Count)
+            .unwrap_or(0);
+
+        count = count.checked_add(1).expect("overflow");
+        env.storage().instance().set(&DataKey::Count, &count);
+
+        // Emit native event
+        env.events().publish(
+            (symbol_short!("counter"), symbol_short!("inc")),
+            (user, count),
+        );
+
+        count
+    }
+
+    /// Read the current count
+    pub fn get_count(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::Count).unwrap_or(0)
+    }
+}
+```
+
+</CodeGroup>
+
+### Key Differences in the Code:
+
+1. **No Account Boilerplate**: Soroban does not require `space` calculation, account serialization definitions, or PDA seed constraints in macro headers.
+2. **Integrated Storage**: Soroban reads and writes typed Rust keys directly via `env.storage().instance()`.
+3. **Explicit Auth**: `user.require_auth()` validates that the caller signed the transaction without requiring an Anchor `Signer<'info>` wrapper.
+4. **`no_std` Environment**: Both platforms target `no_std` WebAssembly/eBPF environments, ensuring small binaries and fast execution.
+
+---
+
+## 4. Cross-Contract Invocations (CPI)
+
+On Solana, invoking another program requires constructing an `Instruction` with the target `program_id`, supplying the full list of `AccountInfo` references, and passing PDA seeds to `invoke_signed`.
+
+On Soroban, cross-contract calls are **strongly typed**:
+
+- When a contract is compiled, Soroban generates a typed client.
+- You can instantiate the client directly using the target contract's `Address` and call methods as standard Rust functions:
+
+```rust
+// Soroban Typed CPI Example
+use soroban_sdk::{contract, contractimpl, Address, Env};
+
+// If importing from another contract's crate or interface:
+// soroban_sdk::contractimport!(file = "../target/wasm32-unknown-unknown/release/other_contract.wasm");
+
+#[contract]
+pub struct AggregatorContract;
+
+#[contractimpl]
+impl AggregatorContract {
+    pub fn call_counter(env: Env, counter_id: Address, user: Address) -> u64 {
+        user.require_auth();
+
+        // Instantiate typed client for the target contract
+        let client = CounterContractClient::new(&env, &counter_id);
+
+        // Standard Rust method invocation
+        client.increment(&user)
+    }
+}
+```
+
+<Info>
+
+For dynamic dispatch without a pre-generated client, contracts can also use the lower-level `env.invoke_contract(&contract_id, &function_symbol, args_vec)`.
+
+</Info>
+
+---
+
+## 5. Token Ecosystem: SPL-Token vs. Stellar Assets (SAC)
+
+In Solana, tokens follow the SPL-Token standard:
+
+- Every token requires a **Mint Account**.
+- Users hold balances in **Associated Token Accounts (ATAs)**.
+- Transacting requires managing both the user's wallet address and their ATA.
+
+In Stellar and Soroban:
+
+- Stellar has first-class protocol-level assets (like native XLM and fiat stablecoins like USDC).
+- Any classic Stellar asset is automatically accessible within smart contracts via the **Stellar Asset Contract (SAC)**.
+- SAC and custom Soroban tokens implement the standardized **SEP-41 Token Interface**, allowing contracts to interact with any token uniformly:
+
+```rust
+use soroban_sdk::{token, Address, Env};
+
+pub fn transfer_tokens(env: Env, token_address: Address, from: Address, to: Address, amount: i128) {
+    from.require_auth();
+
+    // Create client for any SEP-41 compliant token or Stellar Asset
+    let token_client = token::Client::new(&env, &token_address);
+
+    // Directly transfer; token_client validates authorization
+    token_client.transfer(&from, &to, &amount);
+}
+```
+
+---
+
+## 6. CLI & Tooling Transition
+
+Transitioning your deployment and interaction workflow from Solana CLI / Anchor CLI to `stellar-cli` is straightforward:
+
+| Task | Solana / Anchor | Stellar CLI (`stellar`) |
+| :-- | :-- | :-- |
+| **Generate Keypair** | `solana-keygen new --outfile id.json` | `stellar keys generate alice` |
+| **Fund Account** | `solana airdrop 2` | `stellar keys fund alice --network testnet` |
+| **Build Contract** | `anchor build` / `cargo build-sbf` | `stellar contract build` |
+| **Deploy Contract** | `solana program deploy target/deploy/prog.so` | `stellar contract deploy --wasm target/wasm32-unknown-unknown/release/counter.wasm --source alice --network testnet` |
+| **Invoke Function** | `solana program invoke ...` | `stellar contract invoke --id <CONTRACT_ID> --source alice --network testnet -- increment --user alice` |
+| **Inspect Wasm** | `solana program show <ID>` | `stellar contract inspect --wasm target/.../contract.wasm` |
+
+---
+
+## 7. Fast In-Memory Unit Testing
+
+One of the largest productivity boosts when migrating from Solana to Soroban is testing.
+
+On Solana, unit tests typically require spinning up a `solana-test-validator` instance or using complex asynchronous TypeScript frameworks.
+
+With Soroban, the `soroban-sdk` includes a native in-memory test environment. You can test complete contract execution, multi-contract interactions, and authorization checks in pure Rust with millisecond execution speed:
+
+```rust
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Address, Env};
+
+    #[test]
+    fn test_counter_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Register contract in test environment
+        let contract_id = env.register(CounterContract, ());
+        let client = CounterContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        // Initialize
+        client.initialize(&admin);
+        assert_eq!(client.get_count(), 0);
+
+        // Increment
+        let new_count = client.increment(&user);
+        assert_eq!(new_count, 1);
+        assert_eq!(client.get_count(), 1);
+    }
+}
+```
+
+Run tests instantly with:
+
+```bash
+cargo test
+```
+
+---
+
+## Summary & Next Steps
+
+Migrating from Solana to Stellar Soroban allows you to retain your Rust expertise while enjoying:
+
+- **Simplified State**: No manual PDA seed and space arithmetic.
+- **Expressive Authorization**: Native `Address::require_auth()` with support for account abstraction out of the box.
+- **Sub-Second Rust Tests**: Zero validator spin-up time for fast test suites.
+- **Seamless Asset Interoperability**: Direct access to high-liquidity fiat anchors and Stellar assets via the built-in SAC.
+
+Ready to begin? Explore the [Soroban Setup Guide](../../build/smart-contracts/getting-started/setup) or clone example contracts from the [Soroban Examples Repository](https://github.com/stellar/soroban-examples).
